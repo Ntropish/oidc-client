@@ -1,8 +1,8 @@
 export interface OidcUser {
   sub: string;
-  display_name?: string;
-  username?: string;
-  avatar_url?: string;
+  preferred_username?: string;
+  name?: string;
+  picture?: string;
   groups?: string[];
 }
 
