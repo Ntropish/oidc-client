@@ -6,6 +6,7 @@ import type { OidcUser } from './types';
 interface AuthContextValue {
   isAuthenticated: boolean;
   isLoading: boolean;
+  error: Error | null;
   user: OidcUser | null;
   login: () => Promise<void>;
   logout: () => Promise<void>;
@@ -24,6 +25,7 @@ export function AuthProvider({
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
   const [user, setUser] = useState<OidcUser | null>(null);
+  const [error, setError] = useState<Error | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -46,6 +48,9 @@ export function AuthProvider({
         }
       } catch (err) {
         console.error('Auth initialization failed:', err);
+        if (!cancelled) {
+          setError(err instanceof Error ? err : new Error(String(err)));
+        }
       } finally {
         if (!cancelled) setIsLoading(false);
       }
@@ -58,14 +63,26 @@ export function AuthProvider({
   const value: AuthContextValue = {
     isAuthenticated,
     isLoading,
+    error,
     user,
     login: () => client.login(),
     logout: async () => {
-      await client.logout();
-      setIsAuthenticated(false);
-      setUser(null);
+      try {
+        await client.logout();
+        setIsAuthenticated(false);
+        setUser(null);
+      } catch (err) {
+        setError(err instanceof Error ? err : new Error(String(err)));
+      }
     },
-    getAccessToken: () => client.getAccessToken(),
+    getAccessToken: async () => {
+      try {
+        return await client.getAccessToken();
+      } catch (err) {
+        setError(err instanceof Error ? err : new Error(String(err)));
+        throw err;
+      }
+    },
   };
 
   return createElement(AuthContext.Provider, { value }, children);
@@ -78,8 +95,8 @@ function useAuthContext(): AuthContextValue {
 }
 
 export function useAuth() {
-  const { isAuthenticated, isLoading, login, logout, getAccessToken } = useAuthContext();
-  return { isAuthenticated, isLoading, login, logout, getAccessToken };
+  const { isAuthenticated, isLoading, error, login, logout, getAccessToken } = useAuthContext();
+  return { isAuthenticated, isLoading, error, login, logout, getAccessToken };
 }
 
 export function useUser() {
