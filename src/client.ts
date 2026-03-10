@@ -10,6 +10,7 @@ export interface OidcClientOptions {
 }
 
 interface OidcDiscovery {
+  issuer: string;
   authorization_endpoint: string;
   token_endpoint: string;
   userinfo_endpoint: string;
@@ -25,6 +26,23 @@ const STORAGE_KEYS = {
 } as const;
 
 const PKCE_VERIFIER_KEY = 'oidc:pkce_verifier';
+const STATE_KEY = 'oidc:state';
+const NONCE_KEY = 'oidc:nonce';
+
+function generateRandomString(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  let binary = '';
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function decodeJwtPayload(token: string): Record<string, unknown> {
+  const payload = token.split('.')[1];
+  const decoded = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
+  return JSON.parse(decoded);
+}
 
 export class OidcClient {
   private issuer: string;
@@ -33,6 +51,7 @@ export class OidcClient {
   private scope: string;
   private storage: Storage;
   private discovery: OidcDiscovery | null = null;
+  private _refreshPromise: Promise<void> | null = null;
 
   constructor(options: OidcClientOptions) {
     this.issuer = options.issuer.replace(/\/$/, '');
@@ -46,8 +65,17 @@ export class OidcClient {
     if (this.discovery) return this.discovery;
     const res = await fetch(`${this.issuer}/.well-known/openid-configuration`);
     if (!res.ok) throw new Error(`Failed to fetch OIDC discovery: ${res.status}`);
-    this.discovery = await res.json();
-    return this.discovery!;
+    const doc: OidcDiscovery = await res.json();
+
+    // Validate issuer matches
+    if (doc.issuer.replace(/\/$/, '') !== this.issuer) {
+      throw new Error(
+        `Issuer mismatch: expected "${this.issuer}", got "${doc.issuer}"`
+      );
+    }
+
+    this.discovery = doc;
+    return this.discovery;
   }
 
   async login(): Promise<void> {
@@ -55,7 +83,14 @@ export class OidcClient {
     const verifier = generateVerifier();
     const challenge = await generateChallenge(verifier);
 
+    // Generate state for CSRF protection
+    const state = generateRandomString();
+    // Generate nonce for replay prevention
+    const nonce = generateRandomString();
+
     sessionStorage.setItem(PKCE_VERIFIER_KEY, verifier);
+    sessionStorage.setItem(STATE_KEY, state);
+    sessionStorage.setItem(NONCE_KEY, nonce);
 
     const params = new URLSearchParams({
       response_type: 'code',
@@ -64,6 +99,8 @@ export class OidcClient {
       scope: this.scope,
       code_challenge: challenge,
       code_challenge_method: 'S256',
+      state,
+      nonce,
     });
 
     window.location.href = `${discovery.authorization_endpoint}?${params}`;
@@ -73,6 +110,17 @@ export class OidcClient {
     const params = new URLSearchParams(window.location.search);
     const code = params.get('code');
     if (!code) throw new Error('No authorization code in URL');
+
+    // Validate state parameter (CSRF protection)
+    const returnedState = params.get('state');
+    const storedState = sessionStorage.getItem(STATE_KEY);
+    if (!returnedState || !storedState || returnedState !== storedState) {
+      sessionStorage.removeItem(STATE_KEY);
+      sessionStorage.removeItem(NONCE_KEY);
+      sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+      throw new Error('State parameter mismatch — possible CSRF attack');
+    }
+    sessionStorage.removeItem(STATE_KEY);
 
     const verifier = sessionStorage.getItem(PKCE_VERIFIER_KEY);
     if (!verifier) throw new Error('No PKCE verifier found');
@@ -87,20 +135,49 @@ export class OidcClient {
       code_verifier: verifier,
     });
 
-    const res = await fetch(discovery.token_endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body,
-    });
+    let res: Response;
+    try {
+      res = await fetch(discovery.token_endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body,
+      });
+    } catch (err) {
+      // Clean up PKCE verifier and nonce on network error
+      sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+      sessionStorage.removeItem(NONCE_KEY);
+      throw err;
+    }
 
     if (!res.ok) {
+      // Clean up PKCE verifier and nonce on token exchange failure
+      sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+      sessionStorage.removeItem(NONCE_KEY);
       const text = await res.text();
       throw new Error(`Token exchange failed: ${res.status} ${text}`);
     }
 
     const data = await res.json();
-    this.storeTokens(data);
     sessionStorage.removeItem(PKCE_VERIFIER_KEY);
+
+    // Validate nonce in ID token (replay prevention)
+    const storedNonce = sessionStorage.getItem(NONCE_KEY);
+    if (storedNonce) {
+      try {
+        const idPayload = decodeJwtPayload(data.id_token);
+        if (idPayload.nonce !== storedNonce) {
+          sessionStorage.removeItem(NONCE_KEY);
+          throw new Error('Nonce mismatch in ID token — possible replay attack');
+        }
+      } catch (err) {
+        sessionStorage.removeItem(NONCE_KEY);
+        if (err instanceof Error && err.message.includes('Nonce mismatch')) throw err;
+        throw new Error('Failed to validate nonce in ID token');
+      }
+    }
+    sessionStorage.removeItem(NONCE_KEY);
+
+    this.storeTokens(data);
 
     // Clean up the URL
     window.history.replaceState({}, '', window.location.pathname);
@@ -114,7 +191,13 @@ export class OidcClient {
 
     // Refresh if within 60 seconds of expiry
     if (now >= expiry - 60_000) {
-      await this.refreshToken();
+      // Deduplicate concurrent refresh calls
+      if (!this._refreshPromise) {
+        this._refreshPromise = this.refreshToken().finally(() => {
+          this._refreshPromise = null;
+        });
+      }
+      await this._refreshPromise;
     }
 
     const token = this.storage.getItem(STORAGE_KEYS.accessToken);
@@ -155,9 +238,7 @@ export class OidcClient {
     if (!idToken) return null;
 
     try {
-      const payload = idToken.split('.')[1];
-      const decoded = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
-      return JSON.parse(decoded);
+      return decodeJwtPayload(idToken) as OidcUser;
     } catch {
       return null;
     }
@@ -166,7 +247,22 @@ export class OidcClient {
   async logout(redirectTo?: string): Promise<void> {
     this.clearTokens();
     if (redirectTo) {
-      window.location.href = redirectTo;
+      // Validate redirect URL: must be relative or same-origin
+      try {
+        const url = new URL(redirectTo, window.location.origin);
+        if (url.origin !== window.location.origin) {
+          throw new Error(
+            `Logout redirect blocked: "${redirectTo}" is not same-origin`
+          );
+        }
+        window.location.href = url.href;
+      } catch (err) {
+        if (err instanceof Error && err.message.includes('Logout redirect blocked')) {
+          throw err;
+        }
+        // If URL parsing fails, treat as relative path
+        window.location.href = redirectTo;
+      }
     }
   }
 
