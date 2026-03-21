@@ -103,3 +103,5 @@ export function useUser() {
   const { user, isLoading } = useAuthContext();
   return { user, isLoading };
 }
+
+export { AuthProvider as OidcProvider };
