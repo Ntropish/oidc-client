@@ -32,14 +32,16 @@ const NONCE_KEY = 'oidc:nonce';
 function generateRandomString(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
   let binary = '';
-  for (let i = 0; i < bytes.length; i++) {
-    binary += String.fromCharCode(bytes[i]);
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
   }
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 function decodeJwtPayload(token: string): Record<string, unknown> {
-  const payload = token.split('.')[1];
+  const parts = token.split('.');
+  const payload = parts[1];
+  if (!payload) throw new Error('Invalid JWT: missing payload segment');
   const decoded = atob(payload.replace(/-/g, '+').replace(/_/g, '/'));
   return JSON.parse(decoded);
 }
@@ -238,7 +240,7 @@ export class OidcClient {
     if (!idToken) return null;
 
     try {
-      return decodeJwtPayload(idToken) as OidcUser;
+      return decodeJwtPayload(idToken) as unknown as OidcUser;
     } catch {
       return null;
     }
@@ -270,6 +272,30 @@ export class OidcClient {
     const token = this.storage.getItem(STORAGE_KEYS.accessToken);
     const expiry = Number(this.storage.getItem(STORAGE_KEYS.tokenExpiry) ?? '0');
     return !!token && Date.now() < expiry;
+  }
+
+  // Best-effort session restore on app boot. Returns the persisted user if the access
+  // token is still fresh, otherwise silently exchanges a stored refresh token for a new
+  // pair. Returns null when no usable credentials remain — the caller should treat that
+  // as "not signed in" and trigger the login flow.
+  //
+  // Calling this in the React init path avoids the consent-on-every-load regression
+  // where a 15-min access token expiry forces /authorize even though a long-lived refresh
+  // token is sitting in localStorage.
+  async tryRestoreSession(): Promise<OidcUser | null> {
+    if (this.isAuthenticated()) {
+      return this.getUser();
+    }
+    const refreshToken = this.storage.getItem(STORAGE_KEYS.refreshToken);
+    if (!refreshToken) return null;
+    try {
+      await this.refreshToken();
+      return this.getUser();
+    } catch {
+      // Refresh failed (revoked, expired, network). refreshToken() has already cleared
+      // tokens; the caller will fall through to login.
+      return null;
+    }
   }
 
   private storeTokens(data: {

@@ -40,9 +40,14 @@ export function AuthProvider({
             setUser(user);
             setIsAuthenticated(true);
           }
-        } else if (client.isAuthenticated()) {
-          if (!cancelled) {
-            setUser(client.getUser());
+        } else {
+          // Try to restore a previous session — either we still have a fresh access
+          // token, or we can quietly trade a stored refresh token for one. Falling
+          // through to "not authenticated" would force every reload back through
+          // /authorize and the consent screen.
+          const restoredUser = await client.tryRestoreSession();
+          if (restoredUser && !cancelled) {
+            setUser(restoredUser);
             setIsAuthenticated(true);
           }
         }
@@ -105,3 +110,4 @@ export function useUser() {
 }
 
 export { AuthProvider as OidcProvider };
+export { AuthLoadingScreen, AuthGate } from './callback-screen';
